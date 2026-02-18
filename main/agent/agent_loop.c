@@ -16,7 +16,12 @@
 
 static const char *TAG = "agent";
 
-#define TOOL_OUTPUT_SIZE  (8 * 1024)
+#define TOOL_OUTPUT_SIZE  (2 * 1024)
+
+/* Fallback internal buffers when PSRAM is unavailable */
+static char s_system_prompt_buf[MIMI_CONTEXT_BUF_SIZE];
+static char s_history_json_buf[MIMI_LLM_STREAM_BUF_SIZE];
+static char s_tool_output_buf[TOOL_OUTPUT_SIZE];
 
 /* Build the assistant content array from llm_response_t for the messages history.
  * Returns a cJSON array with text and tool_use blocks. */
@@ -172,18 +177,28 @@ static void agent_loop_task(void *arg)
 {
     ESP_LOGI(TAG, "Agent loop started on core %d", xPortGetCoreID());
 
-    /* Allocate large buffers from PSRAM */
+    /* Allocate large buffers from PSRAM if available, else use static internal RAM */
     char *system_prompt = heap_caps_calloc(1, MIMI_CONTEXT_BUF_SIZE, MALLOC_CAP_SPIRAM);
     char *history_json = heap_caps_calloc(1, MIMI_LLM_STREAM_BUF_SIZE, MALLOC_CAP_SPIRAM);
     char *tool_output = heap_caps_calloc(1, TOOL_OUTPUT_SIZE, MALLOC_CAP_SPIRAM);
 
     if (!system_prompt || !history_json || !tool_output) {
-        ESP_LOGE(TAG, "Failed to allocate PSRAM buffers");
-        vTaskDelete(NULL);
-        return;
+        ESP_LOGW(TAG, "PSRAM buffers unavailable; using static internal buffers");
+        free(system_prompt);
+        free(history_json);
+        free(tool_output);
+        system_prompt = s_system_prompt_buf;
+        history_json = s_history_json_buf;
+        tool_output = s_tool_output_buf;
+        system_prompt[0] = '\0';
+        history_json[0] = '\0';
+        tool_output[0] = '\0';
     }
 
-    const char *tools_json = tool_registry_get_tools_json();
+    const char *tools_json = NULL;
+#if MIMI_ENABLE_TOOLS
+    tools_json = tool_registry_get_tools_json();
+#endif
 
     while (1) {
         mimi_msg_t msg;

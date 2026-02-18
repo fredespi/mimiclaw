@@ -13,6 +13,8 @@ idf_component_register(
         "bus/message_bus.c"
         "wifi/wifi_manager.c"
         "telegram/telegram_bot.c"
+        "telegram/telegram_http.c"
+        "telegram/telegram_tls_test.c"
         "llm/llm_proxy.c"
         "agent/agent_loop.c"
         "agent/context_builder.c"
@@ -30,6 +32,7 @@ idf_component_register(
         "tools/tool_get_time.c"
         "tools/tool_files.c"
         "skills/skill_loader.c"
+        "time/time_sync.c"
     INCLUDE_DIRS
         "."
     EMBED_FILES

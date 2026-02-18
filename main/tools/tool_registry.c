@@ -1,4 +1,5 @@
 #include "tool_registry.h"
+#include "mimi_config.h"
 #include "tools/tool_web_search.h"
 #include "tools/tool_get_time.h"
 #include "tools/tool_files.h"
@@ -53,6 +54,13 @@ static void build_tools_json(void)
 esp_err_t tool_registry_init(void)
 {
     s_tool_count = 0;
+
+    if (!MIMI_ENABLE_TOOLS) {
+        free(s_tools_json);
+        s_tools_json = NULL;
+        ESP_LOGI(TAG, "Tools disabled");
+        return ESP_OK;
+    }
 
     /* Register web_search */
     tool_web_search_init();
@@ -189,7 +197,12 @@ const char *tool_registry_get_tools_json(void)
 esp_err_t tool_registry_execute(const char *name, const char *input_json,
                                 char *output, size_t output_size)
 {
+    if (!name) {
+        snprintf(output, output_size, "Error: tool name is null");
+        return ESP_ERR_INVALID_ARG;
+    }
     for (int i = 0; i < s_tool_count; i++) {
+        if (!s_tools[i].name) continue;
         if (strcmp(s_tools[i].name, name) == 0) {
             ESP_LOGI(TAG, "Executing tool: %s", name);
             return s_tools[i].execute(input_json, output, output_size);

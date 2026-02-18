@@ -13,6 +13,11 @@ esp_err_t telegram_bot_init(void);
 esp_err_t telegram_bot_start(void);
 
 /**
+ * Stop the Telegram polling task.
+ */
+esp_err_t telegram_bot_stop(void);
+
+/**
  * Send a text message to a Telegram chat.
  * Automatically splits messages longer than 4096 chars.
  * @param chat_id  Telegram chat ID (numeric string)

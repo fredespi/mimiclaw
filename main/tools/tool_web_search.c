@@ -4,6 +4,7 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include "esp_log.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
@@ -15,27 +16,17 @@ static const char *TAG = "web_search";
 
 static char s_search_key[128] = {0};
 
-#define SEARCH_BUF_SIZE     (16 * 1024)
-#define SEARCH_RESULT_COUNT 5
+#define SEARCH_RESULT_COUNT 3
+#define SEARCH_TEMP_FILE    "/spiffs/tmp_search.json"
+#define SEARCH_READ_BUF     (4 * 1024)
 
-/* ── Response accumulator ─────────────────────────────────────── */
-
-typedef struct {
-    char *data;
-    size_t len;
-    size_t cap;
-} search_buf_t;
+/* ── Write HTTP response directly to SPIFFS temp file ─────────── */
 
 static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 {
-    search_buf_t *sb = (search_buf_t *)evt->user_data;
-    if (evt->event_id == HTTP_EVENT_ON_DATA) {
-        size_t needed = sb->len + evt->data_len;
-        if (needed < sb->cap) {
-            memcpy(sb->data + sb->len, evt->data, evt->data_len);
-            sb->len += evt->data_len;
-            sb->data[sb->len] = '\0';
-        }
+    FILE **fp = (FILE **)evt->user_data;
+    if (evt->event_id == HTTP_EVENT_ON_DATA && *fp) {
+        fwrite(evt->data, 1, evt->data_len, *fp);
     }
     return ESP_OK;
 }
@@ -130,16 +121,17 @@ static void format_results(cJSON *root, char *output, size_t output_size)
     }
 }
 
-/* ── Direct HTTPS request ─────────────────────────────────────── */
+/* ── Direct HTTPS request → write to SPIFFS temp file ─────────── */
 
-static esp_err_t search_direct(const char *url, search_buf_t *sb)
+static esp_err_t search_direct(const char *url, FILE *fp)
 {
     esp_http_client_config_t config = {
         .url = url,
         .event_handler = http_event_handler,
-        .user_data = sb,
+        .user_data = &fp,
         .timeout_ms = 15000,
-        .buffer_size = 4096,
+        .buffer_size = 2048,
+        .buffer_size_tx = 1024,
         .crt_bundle_attach = esp_crt_bundle_attach,
     };
 
@@ -153,7 +145,10 @@ static esp_err_t search_direct(const char *url, search_buf_t *sb)
     int status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
 
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "HTTP request failed: %s", esp_err_to_name(err));
+        return err;
+    }
     if (status != 200) {
         ESP_LOGE(TAG, "Search API returned %d", status);
         return ESP_FAIL;
@@ -161,9 +156,9 @@ static esp_err_t search_direct(const char *url, search_buf_t *sb)
     return ESP_OK;
 }
 
-/* ── Proxy HTTPS request ──────────────────────────────────────── */
+/* ── Proxy HTTPS request → write to SPIFFS temp file ──────────── */
 
-static esp_err_t search_via_proxy(const char *path, search_buf_t *sb)
+static esp_err_t search_via_proxy(const char *path, FILE *fp)
 {
     proxy_conn_t *conn = proxy_conn_open("api.search.brave.com", 443, 15000);
     if (!conn) return ESP_ERR_HTTP_CONNECT;
@@ -182,38 +177,50 @@ static esp_err_t search_via_proxy(const char *path, search_buf_t *sb)
         return ESP_ERR_HTTP_WRITE_DATA;
     }
 
-    /* Read full response */
-    char tmp[4096];
+    /* Read response into temp buffer, write to file */
+    char tmp[1024];
     size_t total = 0;
+    bool headers_done = false;
+    size_t hdr_buf_len = 0;
+    char hdr_buf[2048];  /* small buffer just for HTTP headers */
+    int status = 0;
+
     while (1) {
         int n = proxy_conn_read(conn, tmp, sizeof(tmp), 15000);
         if (n <= 0) break;
-        size_t copy = (total + n < sb->cap - 1) ? (size_t)n : sb->cap - 1 - total;
-        if (copy > 0) {
-            memcpy(sb->data + total, tmp, copy);
-            total += copy;
+
+        if (!headers_done) {
+            /* Accumulate until we find end of headers */
+            size_t copy = (size_t)n;
+            if (hdr_buf_len + copy > sizeof(hdr_buf) - 1)
+                copy = sizeof(hdr_buf) - 1 - hdr_buf_len;
+            memcpy(hdr_buf + hdr_buf_len, tmp, copy);
+            hdr_buf_len += copy;
+            hdr_buf[hdr_buf_len] = '\0';
+
+            char *body = strstr(hdr_buf, "\r\n\r\n");
+            if (body) {
+                /* Parse status from header */
+                if (hdr_buf_len > 5 && strncmp(hdr_buf, "HTTP/", 5) == 0) {
+                    const char *sp = strchr(hdr_buf, ' ');
+                    if (sp) status = atoi(sp + 1);
+                }
+                headers_done = true;
+                body += 4;
+                size_t body_len = hdr_buf_len - (body - hdr_buf);
+                if (body_len > 0) {
+                    fwrite(body, 1, body_len, fp);
+                    total += body_len;
+                }
+            }
+        } else {
+            fwrite(tmp, 1, (size_t)n, fp);
+            total += (size_t)n;
         }
     }
-    sb->data[total] = '\0';
-    sb->len = total;
     proxy_conn_close(conn);
 
-    /* Check status */
-    int status = 0;
-    if (total > 5 && strncmp(sb->data, "HTTP/", 5) == 0) {
-        const char *sp = strchr(sb->data, ' ');
-        if (sp) status = atoi(sp + 1);
-    }
-
-    /* Strip headers */
-    char *body = strstr(sb->data, "\r\n\r\n");
-    if (body) {
-        body += 4;
-        size_t blen = total - (body - sb->data);
-        memmove(sb->data, body, blen);
-        sb->len = blen;
-        sb->data[sb->len] = '\0';
-    }
+    ESP_LOGI(TAG, "Proxy: received %d body bytes, status=%d", (int)total, status);
 
     if (status != 200) {
         ESP_LOGE(TAG, "Search API returned %d via proxy", status);
@@ -246,6 +253,7 @@ esp_err_t tool_web_search_execute(const char *input_json, char *output, size_t o
     }
 
     ESP_LOGI(TAG, "Searching: %s", query->valuestring);
+    ESP_LOGI(TAG, "Free internal heap: %d", (int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 
     /* Build URL */
     char encoded_query[256];
@@ -254,36 +262,71 @@ esp_err_t tool_web_search_execute(const char *input_json, char *output, size_t o
 
     char path[384];
     snprintf(path, sizeof(path),
-             "/res/v1/web/search?q=%s&count=%d", encoded_query, SEARCH_RESULT_COUNT);
+             "/res/v1/web/search?q=%s&count=%d&result_filter=web&text_decorations=false&extra_snippets=false",
+             encoded_query, SEARCH_RESULT_COUNT);
 
-    /* Allocate response buffer from PSRAM */
-    search_buf_t sb = {0};
-    sb.data = heap_caps_calloc(1, SEARCH_BUF_SIZE, MALLOC_CAP_SPIRAM);
-    if (!sb.data) {
-        snprintf(output, output_size, "Error: Out of memory");
-        return ESP_ERR_NO_MEM;
+    /* Open temp file for writing — HTTP response goes to flash, not RAM */
+    FILE *fp = fopen(SEARCH_TEMP_FILE, "w");
+    if (!fp) {
+        snprintf(output, output_size, "Error: Cannot create temp file");
+        return ESP_FAIL;
     }
-    sb.cap = SEARCH_BUF_SIZE;
 
-    /* Make HTTP request */
+    /* Make HTTP request — response written to SPIFFS temp file */
     esp_err_t err;
     if (http_proxy_is_enabled()) {
-        err = search_via_proxy(path, &sb);
+        err = search_via_proxy(path, fp);
     } else {
         char url[512];
         snprintf(url, sizeof(url), "https://api.search.brave.com%s", path);
-        err = search_direct(url, &sb);
+        err = search_direct(url, fp);
     }
+    fclose(fp);
 
     if (err != ESP_OK) {
-        free(sb.data);
-        snprintf(output, output_size, "Error: Search request failed");
+        remove(SEARCH_TEMP_FILE);
+        snprintf(output, output_size, "Error: Search request failed (%s)", esp_err_to_name(err));
         return err;
     }
 
+    /* TLS is now disconnected — heap is free for parsing.
+     * Read the temp file back into a malloc'd buffer. */
+    fp = fopen(SEARCH_TEMP_FILE, "r");
+    if (!fp) {
+        snprintf(output, output_size, "Error: Cannot read temp file");
+        return ESP_FAIL;
+    }
+
+    fseek(fp, 0, SEEK_END);
+    long fsize = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+
+    ESP_LOGI(TAG, "Search response: %ld bytes on disk, free heap: %d",
+             fsize, (int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+
+    if (fsize <= 0 || fsize > 32 * 1024) {
+        fclose(fp);
+        remove(SEARCH_TEMP_FILE);
+        snprintf(output, output_size, "Error: Invalid response size (%ld)", fsize);
+        return ESP_FAIL;
+    }
+
+    char *json_buf = malloc((size_t)fsize + 1);
+    if (!json_buf) {
+        fclose(fp);
+        remove(SEARCH_TEMP_FILE);
+        snprintf(output, output_size, "Error: Out of memory for parse (%ld bytes)", fsize);
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t nread = fread(json_buf, 1, (size_t)fsize, fp);
+    json_buf[nread] = '\0';
+    fclose(fp);
+    remove(SEARCH_TEMP_FILE);
+
     /* Parse and format results */
-    cJSON *root = cJSON_Parse(sb.data);
-    free(sb.data);
+    cJSON *root = cJSON_Parse(json_buf);
+    free(json_buf);
 
     if (!root) {
         snprintf(output, output_size, "Error: Failed to parse search results");

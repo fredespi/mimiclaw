@@ -2,13 +2,23 @@
 
 #include "esp_check.h"
 #include "led_strip.h"
+#include "soc/soc_caps.h"
 
 #define RGB_GPIO 38
 
 static led_strip_handle_t s_strip = NULL;
 
+static bool gpio_valid_required(int pin)
+{
+    return pin >= 0 && pin < SOC_GPIO_PIN_COUNT;
+}
+
 esp_err_t rgb_init(void)
 {
+    if (!gpio_valid_required(RGB_GPIO)) {
+        ESP_LOGW("rgb", "Invalid RGB GPIO for this target (gpio=%d)", RGB_GPIO);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
     led_strip_config_t strip_config = {
         .strip_gpio_num = RGB_GPIO,
         .max_leds = 1,

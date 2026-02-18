@@ -2,6 +2,17 @@
 
 /* MimiClaw Global Configuration */
 
+/* Optional hardware (set to 0 to silence unsupported peripherals) */
+#ifndef MIMI_ENABLE_DISPLAY
+#define MIMI_ENABLE_DISPLAY        0
+#endif
+#ifndef MIMI_ENABLE_RGB
+#define MIMI_ENABLE_RGB            0
+#endif
+#ifndef MIMI_ENABLE_IMU
+#define MIMI_ENABLE_IMU            0
+#endif
+
 /* Build-time secrets (highest priority, override NVS) */
 #if __has_include("mimi_secrets.h")
 #include "mimi_secrets.h"
@@ -46,17 +57,25 @@
 #define MIMI_TG_POLL_STACK           (12 * 1024)
 #define MIMI_TG_POLL_PRIO            5
 #define MIMI_TG_POLL_CORE            0
+#define TG_CARD_WIDTH   280
+#define TG_CARD_HEIGHT  100
 #define MIMI_TG_CARD_SHOW_MS         3000
 #define MIMI_TG_CARD_BODY_SCALE      3
 
+#define MIMI_AUTO_START_TELEGRAM 1
+
 /* Agent Loop */
-#define MIMI_AGENT_STACK             (24 * 1024)
+#define DEFAULT_TASK_STACK_SIZE (16 * 1024)
+#define MIMI_AGENT_STACK         (16 * 1024)
+#define MIMI_AGENT_MAX_HISTORY   20
+#define MIMI_AGENT_MAX_TOOL_ITER 10
 #define MIMI_AGENT_PRIO              6
 #define MIMI_AGENT_CORE              1
-#define MIMI_AGENT_MAX_HISTORY       20
-#define MIMI_AGENT_MAX_TOOL_ITER     10
-#define MIMI_MAX_TOOL_CALLS          4
-#define MIMI_AGENT_SEND_WORKING_STATUS 1
+#define MAX_AGENT_LOOPS    8
+#define MIMI_MAX_TOOL_CALLS 6
+#define MAX_TOOL_RESULTS   2
+#define SEND_WORKING_STATUS 1
+#define MIMI_ENABLE_TOOLS   1
 
 /* Timezone (POSIX TZ format) */
 #define MIMI_TIMEZONE                "PST8PDT,M3.2.0,M11.1.0"
@@ -64,13 +83,14 @@
 /* LLM */
 #define MIMI_LLM_DEFAULT_MODEL       "claude-opus-4-5"
 #define MIMI_LLM_PROVIDER_DEFAULT    "anthropic"
-#define MIMI_LLM_MAX_TOKENS          4096
+#define MIMI_LLM_MAX_TOKENS          512
 #define MIMI_LLM_API_URL             "https://api.anthropic.com/v1/messages"
 #define MIMI_OPENAI_API_URL          "https://api.openai.com/v1/chat/completions"
 #define MIMI_LLM_API_VERSION         "2023-06-01"
-#define MIMI_LLM_STREAM_BUF_SIZE     (32 * 1024)
-#define MIMI_LLM_LOG_VERBOSE_PAYLOAD 0
-#define MIMI_LLM_LOG_PREVIEW_BYTES   160
+#define LLM_RESPONSE_BUFFER_SIZE      (8 * 1024)
+#define MIMI_LLM_STREAM_BUF_SIZE      (8 * 1024)
+#define MIMI_LLM_LOG_VERBOSE_PAYLOAD  0
+#define MIMI_LLM_LOG_PREVIEW_BYTES    160
 
 /* Message Bus */
 #define MIMI_BUS_QUEUE_LEN           16
@@ -86,7 +106,7 @@
 #define MIMI_MEMORY_FILE             "/spiffs/memory/MEMORY.md"
 #define MIMI_SOUL_FILE               "/spiffs/config/SOUL.md"
 #define MIMI_USER_FILE               "/spiffs/config/USER.md"
-#define MIMI_CONTEXT_BUF_SIZE        (16 * 1024)
+#define MIMI_CONTEXT_BUF_SIZE        (8 * 1024)
 #define MIMI_SESSION_MAX_MSGS        20
 
 /* Cron / Heartbeat */

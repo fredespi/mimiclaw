@@ -1,6 +1,7 @@
 #include "tool_get_time.h"
 #include "mimi_config.h"
 #include "proxy/http_proxy.h"
+#include "time/time_sync.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -16,6 +17,15 @@ static const char *MONTHS[] = {
     "Jan","Feb","Mar","Apr","May","Jun",
     "Jul","Aug","Sep","Oct","Nov","Dec"
 };
+
+static void format_now(char *out, size_t out_size)
+{
+    time_t now = 0;
+    struct tm local = {0};
+    time(&now);
+    localtime_r(&now, &local);
+    strftime(out, out_size, "%Y-%m-%d %H:%M:%S %Z (%A)", &local);
+}
 
 /* Parse "Sat, 01 Feb 2025 10:25:00 GMT" → set system clock, return formatted string */
 static bool parse_and_set_time(const char *date_str, char *out, size_t out_size)
@@ -126,14 +136,11 @@ static esp_err_t fetch_time_direct(char *out, size_t out_size)
     }
 
     /* Get Date header */
-    char date_val[64] = {0};
-    err = esp_http_client_get_header(client, "Date", (char **)&date_val);
-    /* esp_http_client_get_header returns pointer, not copy */
     char *date_ptr = NULL;
-    esp_http_client_get_header(client, "Date", &date_ptr);
+    esp_err_t hdr_err = esp_http_client_get_header(client, "Date", &date_ptr);
     esp_http_client_cleanup(client);
 
-    if (!date_ptr || date_ptr[0] == '\0') return ESP_ERR_NOT_FOUND;
+    if (hdr_err != ESP_OK || !date_ptr || date_ptr[0] == '\0') return ESP_ERR_NOT_FOUND;
 
     if (!parse_and_set_time(date_ptr, out, out_size)) return ESP_FAIL;
     return ESP_OK;
@@ -153,6 +160,13 @@ esp_err_t tool_get_time_execute(const char *input_json, char *output, size_t out
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "Time: %s", output);
     } else {
+        esp_err_t sync_err = time_sync_wait(15000);
+        if (sync_err == ESP_OK) {
+            format_now(output, output_size);
+            ESP_LOGI(TAG, "Time (SNTP): %s", output);
+            return ESP_OK;
+        }
+
         snprintf(output, output_size, "Error: failed to fetch time (%s)", esp_err_to_name(err));
         ESP_LOGE(TAG, "%s", output);
     }

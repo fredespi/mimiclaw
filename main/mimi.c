@@ -29,6 +29,9 @@
 #include "imu/imu_manager.h"
 #include "rgb/rgb.h"
 #include "skills/skill_loader.h"
+#include "cron/cron_service.h"
+#include "time/time_sync.h"
+#include "ota/ota_manager.h"
 
 static const char *TAG = "mimi";
 
@@ -121,14 +124,30 @@ void app_main(void)
              (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
     /* Display + input */
-    ESP_ERROR_CHECK(display_init());
-    display_show_banner();
-    ESP_ERROR_CHECK(rgb_init());
-    rgb_set(255, 0, 0);
+#if MIMI_ENABLE_DISPLAY
+    esp_err_t display_err = display_init();
+    if (display_err == ESP_OK) {
+        display_show_banner();
+    } else {
+        ESP_LOGW(TAG, "Display init skipped: %s", esp_err_to_name(display_err));
+    }
     button_Init();
     config_screen_init();
+#endif
+
+#if MIMI_ENABLE_RGB
+    esp_err_t rgb_err = rgb_init();
+    if (rgb_err == ESP_OK) {
+        rgb_set(255, 0, 0);
+    } else {
+        ESP_LOGW(TAG, "RGB init skipped: %s", esp_err_to_name(rgb_err));
+    }
+#endif
+
+#if MIMI_ENABLE_IMU
     imu_manager_init();
     imu_manager_set_shake_callback(config_screen_toggle);
+#endif
 
     /* Phase 1: Core infrastructure */
     ESP_ERROR_CHECK(init_nvs());
@@ -161,16 +180,18 @@ void app_main(void)
         if (wifi_manager_wait_connected(30000) == ESP_OK) {
             ESP_LOGI(TAG, "WiFi connected: %s", wifi_manager_get_ip());
 
-            /* Outbound dispatch task should start first to avoid dropping early replies. */
-            ESP_ERROR_CHECK((xTaskCreatePinnedToCore(
-                outbound_dispatch_task, "outbound",
-                MIMI_OUTBOUND_STACK, NULL,
-                MIMI_OUTBOUND_PRIO, NULL, MIMI_OUTBOUND_CORE) == pdPASS)
-                ? ESP_OK : ESP_FAIL);
+            time_sync_wait(10000);
+
+            ota_check_post_update();
+
+            // Start outbound dispatch task
+            xTaskCreate(outbound_dispatch_task, "outbound", 4096, NULL, 5, NULL);
 
             /* Start network-dependent services */
-            ESP_ERROR_CHECK(agent_loop_start());
+#if MIMI_AUTO_START_TELEGRAM
             ESP_ERROR_CHECK(telegram_bot_start());
+#endif
+            ESP_ERROR_CHECK(agent_loop_start());
             cron_service_start();
             heartbeat_start();
             ESP_ERROR_CHECK(ws_server_start());

@@ -4,20 +4,27 @@
 #include "proxy/http_proxy.h"
 #include "display/display.h"
 #include "ui/config_screen.h"
+#include "telegram/telegram_http.h"
+#include "ota/ota_manager.h"
 
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <inttypes.h>
 #include "esp_log.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
 #include "nvs.h"
 #include "cJSON.h"
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 static const char *TAG = "telegram";
 
 static char s_bot_token[128] = MIMI_SECRET_TG_TOKEN;
 static int64_t s_update_offset = 0;
+static TaskHandle_t s_tg_task = NULL;
 
 /* HTTP response accumulator */
 typedef struct {
@@ -55,17 +62,20 @@ static char *tg_api_call_via_proxy(const char *path, const char *post_data)
                                           (MIMI_TG_POLL_TIMEOUT_S + 5) * 1000);
     if (!conn) return NULL;
 
+    telegram_http_request_t req;
+    telegram_http_prepare_request(&req, s_bot_token, path, post_data);
+
     /* Build HTTP request */
     char header[512];
     int hlen;
-    if (post_data) {
+    if (req.is_post) {
         hlen = snprintf(header, sizeof(header),
             "POST /bot%s/%s HTTP/1.1\r\n"
             "Host: api.telegram.org\r\n"
             "Content-Type: application/json\r\n"
             "Content-Length: %d\r\n"
             "Connection: close\r\n\r\n",
-            s_bot_token, path, (int)strlen(post_data));
+            s_bot_token, path, (int)req.content_length);
     } else {
         hlen = snprintf(header, sizeof(header),
             "GET /bot%s/%s HTTP/1.1\r\n"
@@ -78,7 +88,7 @@ static char *tg_api_call_via_proxy(const char *path, const char *post_data)
         proxy_conn_close(conn);
         return NULL;
     }
-    if (post_data && proxy_conn_write(conn, post_data, strlen(post_data)) < 0) {
+    if (req.is_post && proxy_conn_write(conn, post_data, req.content_length) < 0) {
         proxy_conn_close(conn);
         return NULL;
     }
@@ -118,8 +128,8 @@ static char *tg_api_call_via_proxy(const char *path, const char *post_data)
 
 static char *tg_api_call_direct(const char *method, const char *post_data)
 {
-    char url[256];
-    snprintf(url, sizeof(url), "https://api.telegram.org/bot%s/%s", s_bot_token, method);
+    telegram_http_request_t req;
+    telegram_http_prepare_request(&req, s_bot_token, method, post_data);
 
     http_resp_t resp = {
         .buf = calloc(1, 4096),
@@ -129,7 +139,7 @@ static char *tg_api_call_direct(const char *method, const char *post_data)
     if (!resp.buf) return NULL;
 
     esp_http_client_config_t config = {
-        .url = url,
+        .url = req.url,
         .event_handler = http_event_handler,
         .user_data = &resp,
         .timeout_ms = (MIMI_TG_POLL_TIMEOUT_S + 5) * 1000,
@@ -144,10 +154,10 @@ static char *tg_api_call_direct(const char *method, const char *post_data)
         return NULL;
     }
 
-    if (post_data) {
+    if (req.is_post) {
         esp_http_client_set_method(client, HTTP_METHOD_POST);
-        esp_http_client_set_header(client, "Content-Type", "application/json");
-        esp_http_client_set_post_field(client, post_data, strlen(post_data));
+        esp_http_client_set_header(client, "Content-Type", req.content_type);
+        esp_http_client_set_post_field(client, post_data, req.content_length);
     }
 
     esp_err_t err = esp_http_client_perform(client);
@@ -192,15 +202,18 @@ static bool tg_response_is_ok(const char *resp, const char **out_desc)
         cJSON_Delete(root);
         return ok;
     }
-
-    /* Proxy or gateway can occasionally return non-standard payload framing. */
-    if (strstr(resp, "\"ok\":true") != NULL) {
-        return true;
-    }
-
     return false;
 }
 
+static void save_update_offset(void)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(MIMI_NVS_TG, NVS_READWRITE, &nvs) == ESP_OK) {
+        nvs_set_i64(nvs, "tg_offset", s_update_offset);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+}
 static void process_updates(const char *json_str)
 {
     cJSON *root = cJSON_Parse(json_str);
@@ -258,12 +271,34 @@ static void process_updates(const char *json_str)
 
         ESP_LOGI(TAG, "Message from chat %s: %.40s...", chat_id_str, text->valuestring);
 
+        /* Show notification card on display */
         if (config_screen_is_active()) {
             config_screen_toggle();
         }
         char title[48];
         snprintf(title, sizeof(title), "TG IN %s", chat_id_str);
         display_show_message_card(title, text->valuestring);
+
+        /* Intercept /ota <url> command */
+        if (strncmp(text->valuestring, "/ota ", 5) == 0) {
+            const char *ota_url = text->valuestring + 5;
+            /* Skip leading whitespace */
+            while (*ota_url == ' ') ota_url++;
+            if (*ota_url) {
+                ESP_LOGI(TAG, "OTA requested: %s", ota_url);
+                /* Persist offset BEFORE OTA so we don't re-process this message after reboot */
+                save_update_offset();
+                telegram_send_message(chat_id_str, "Starting OTA update... device will reboot when done.");
+                esp_err_t ota_err = ota_update_from_url(ota_url);
+                /* If we get here, OTA failed (success would have rebooted) */
+                char err_msg[128];
+                snprintf(err_msg, sizeof(err_msg), "OTA failed: %s", esp_err_to_name(ota_err));
+                telegram_send_message(chat_id_str, err_msg);
+            } else {
+                telegram_send_message(chat_id_str, "Usage: /ota http://host:port/firmware.bin");
+            }
+            continue;
+        }
 
         /* Push to inbound bus */
         mimi_msg_t msg = {0};
@@ -320,6 +355,12 @@ esp_err_t telegram_bot_init(void)
         if (nvs_get_str(nvs, MIMI_NVS_KEY_TG_TOKEN, tmp, &len) == ESP_OK && tmp[0]) {
             strncpy(s_bot_token, tmp, sizeof(s_bot_token) - 1);
         }
+        /* Restore update offset so we don't re-process old messages after reboot */
+        int64_t saved_offset = 0;
+        if (nvs_get_i64(nvs, "tg_offset", &saved_offset) == ESP_OK && saved_offset > 0) {
+            s_update_offset = saved_offset;
+            ESP_LOGI(TAG, "Restored Telegram offset: %" PRId64, s_update_offset);
+        }
         nvs_close(nvs);
     }
 
@@ -335,12 +376,21 @@ esp_err_t telegram_bot_init(void)
 
 esp_err_t telegram_bot_start(void)
 {
+    if (s_tg_task) return ESP_OK;
     BaseType_t ret = xTaskCreatePinnedToCore(
         telegram_poll_task, "tg_poll",
         MIMI_TG_POLL_STACK, NULL,
-        MIMI_TG_POLL_PRIO, NULL, MIMI_TG_POLL_CORE);
+        MIMI_TG_POLL_PRIO, &s_tg_task, MIMI_TG_POLL_CORE);
 
     return (ret == pdPASS) ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t telegram_bot_stop(void)
+{
+    if (!s_tg_task) return ESP_OK;
+    vTaskDelete(s_tg_task);
+    s_tg_task = NULL;
+    return ESP_OK;
 }
 
 esp_err_t telegram_send_message(const char *chat_id, const char *text)

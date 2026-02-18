@@ -1,12 +1,15 @@
 #include "ws_server.h"
 #include "mimi_config.h"
 #include "bus/message_bus.h"
+#include "ota/ota_manager.h"
 
 #include <string.h>
 #include <stdlib.h>
 #include "esp_log.h"
 #include "esp_http_server.h"
 #include "cJSON.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 static const char *TAG = "ws";
 
@@ -76,34 +79,24 @@ static esp_err_t ws_handler(httpd_req_t *req)
         return ESP_OK;
     }
 
-    /* Receive WebSocket frame */
-    httpd_ws_frame_t ws_pkt = {0};
-    ws_pkt.type = HTTPD_WS_TYPE_TEXT;
-
-    /* Get frame length */
-    esp_err_t ret = httpd_ws_recv_frame(req, &ws_pkt, 0);
-    if (ret != ESP_OK) return ret;
-
-    if (ws_pkt.len == 0) return ESP_OK;
-
-    ws_pkt.payload = calloc(1, ws_pkt.len + 1);
-    if (!ws_pkt.payload) return ESP_ERR_NO_MEM;
-
-    ret = httpd_ws_recv_frame(req, &ws_pkt, ws_pkt.len);
-    if (ret != ESP_OK) {
-        free(ws_pkt.payload);
-        return ret;
-    }
-
+    // ESP32: WebSocket frame APIs not available, treat as plain HTTP POST
     int fd = httpd_req_to_sockfd(req);
     ws_client_t *client = find_client_by_fd(fd);
+    const char *chat_id = client ? client->chat_id : "ws_unknown";
 
-    /* Parse JSON message */
-    cJSON *root = cJSON_Parse((char *)ws_pkt.payload);
-    free(ws_pkt.payload);
+    size_t buf_len = httpd_req_get_hdr_value_len(req, "Content-Length");
+    if (buf_len == 0) return ESP_OK;
+    char *buf = calloc(1, buf_len + 1);
+    if (!buf) return ESP_ERR_NO_MEM;
+    int ret = httpd_req_recv(req, buf, buf_len);
+    if (ret <= 0) {
+        free(buf);
+        return ESP_FAIL;
+    }
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
 
     if (!root) {
-        ESP_LOGW(TAG, "Invalid JSON from fd=%d", fd);
         return ESP_OK;
     }
 
@@ -114,7 +107,6 @@ static esp_err_t ws_handler(httpd_req_t *req)
         && content && cJSON_IsString(content)) {
 
         /* Determine chat_id */
-        const char *chat_id = client ? client->chat_id : "ws_unknown";
         cJSON *cid = cJSON_GetObjectItem(root, "chat_id");
         if (cid && cJSON_IsString(cid)) {
             chat_id = cid->valuestring;
@@ -136,8 +128,71 @@ static esp_err_t ws_handler(httpd_req_t *req)
         }
     }
 
+    /* Always send an HTTP response (required for POST handler) */
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddStringToObject(resp, "type", "response");
+    cJSON_AddStringToObject(resp, "content", "OK");
+    cJSON_AddStringToObject(resp, "chat_id", chat_id);
+    char *json_str = cJSON_PrintUnformatted(resp);
+    cJSON_Delete(resp);
+
     cJSON_Delete(root);
+
+    if (json_str) {
+        httpd_resp_set_type(req, "application/json");
+        esp_err_t send_ret = httpd_resp_send(req, json_str, strlen(json_str));
+        if (send_ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to send response: %d", send_ret);
+        }
+        free(json_str);
+    }
+
     return ESP_OK;
+}
+
+/* ---------- OTA endpoint ---------- */
+static esp_err_t ota_handler(httpd_req_t *req)
+{
+    char body[256] = {0};
+    int received = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (received <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty body");
+        return ESP_FAIL;
+    }
+    body[received] = '\0';
+
+    cJSON *root = cJSON_Parse(body);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_FAIL;
+    }
+
+    cJSON *url = cJSON_GetObjectItem(root, "url");
+    if (!url || !cJSON_IsString(url) || !url->valuestring[0]) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing \"url\" field");
+        return ESP_FAIL;
+    }
+
+    /* Copy URL before we free JSON */
+    char ota_url[200];
+    strncpy(ota_url, url->valuestring, sizeof(ota_url) - 1);
+    ota_url[sizeof(ota_url) - 1] = '\0';
+    cJSON_Delete(root);
+
+    ESP_LOGI(TAG, "OTA via HTTP: %s", ota_url);
+
+    /* Respond immediately, then start OTA */
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"ok\",\"message\":\"OTA starting\"}");
+
+    /* Small delay so the HTTP response is flushed */
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    esp_err_t err = ota_update_from_url(ota_url);
+    /* If we get here, OTA failed (success reboots) */
+    ESP_LOGE(TAG, "OTA failed: %s", esp_err_to_name(err));
+    return ESP_FAIL;
 }
 
 esp_err_t ws_server_start(void)
@@ -155,14 +210,23 @@ esp_err_t ws_server_start(void)
         return ret;
     }
 
-    /* Register WebSocket URI */
+    /* Register URI for ESP32: treat as HTTP POST */
     httpd_uri_t ws_uri = {
-        .uri = "/",
-        .method = HTTP_GET,
+        .uri = "/ws",
+        .method = HTTP_POST,
         .handler = ws_handler,
-        .is_websocket = true,
+        .user_ctx = NULL
     };
     httpd_register_uri_handler(s_server, &ws_uri);
+
+    /* OTA endpoint — POST {"url":"http://host:port/firmware.bin"} */
+    httpd_uri_t ota_uri = {
+        .uri = "/ota",
+        .method = HTTP_POST,
+        .handler = ota_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(s_server, &ota_uri);
 
     ESP_LOGI(TAG, "WebSocket server started on port %d", MIMI_WS_PORT);
     return ESP_OK;
@@ -170,40 +234,8 @@ esp_err_t ws_server_start(void)
 
 esp_err_t ws_server_send(const char *chat_id, const char *text)
 {
-    if (!s_server) return ESP_ERR_INVALID_STATE;
-
-    ws_client_t *client = find_client_by_chat_id(chat_id);
-    if (!client) {
-        ESP_LOGW(TAG, "No WS client with chat_id=%s", chat_id);
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    /* Build response JSON */
-    cJSON *resp = cJSON_CreateObject();
-    cJSON_AddStringToObject(resp, "type", "response");
-    cJSON_AddStringToObject(resp, "content", text);
-    cJSON_AddStringToObject(resp, "chat_id", chat_id);
-
-    char *json_str = cJSON_PrintUnformatted(resp);
-    cJSON_Delete(resp);
-
-    if (!json_str) return ESP_ERR_NO_MEM;
-
-    httpd_ws_frame_t ws_pkt = {
-        .type = HTTPD_WS_TYPE_TEXT,
-        .payload = (uint8_t *)json_str,
-        .len = strlen(json_str),
-    };
-
-    esp_err_t ret = httpd_ws_send_frame_async(s_server, client->fd, &ws_pkt);
-    free(json_str);
-
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to send to %s: %s", chat_id, esp_err_to_name(ret));
-        remove_client(client->fd);
-    }
-
-    return ret;
+    // Disabled for ESP32: responses must be sent from ws_handler
+    return ESP_ERR_NOT_SUPPORTED;
 }
 
 esp_err_t ws_server_stop(void)

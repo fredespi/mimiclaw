@@ -11,6 +11,7 @@
 #include "esp_log.h"
 #include "driver/ledc.h"
 #include "driver/spi_master.h"
+#include "soc/soc_caps.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "display/Vernon_ST7789T/Vernon_ST7789T.h"
@@ -76,6 +77,11 @@ typedef struct {
 } qr_draw_ctx_t;
 
 static qr_draw_ctx_t s_qr_ctx;
+
+static bool gpio_valid_required(int pin)
+{
+    return pin >= 0 && pin < SOC_GPIO_PIN_COUNT;
+}
 
 extern const uint8_t _binary_banner_320x172_rgb565_start[];
 extern const uint8_t _binary_banner_320x172_rgb565_end[];
@@ -265,6 +271,17 @@ void display_cycle_backlight(void)
 esp_err_t display_init(void)
 {
     esp_err_t ret = ESP_OK;
+
+    if (!gpio_valid_required(LCD_PIN_SCLK) ||
+        !gpio_valid_required(LCD_PIN_MOSI) ||
+        !gpio_valid_required(LCD_PIN_DC) ||
+        !gpio_valid_required(LCD_PIN_RST) ||
+        !gpio_valid_required(LCD_PIN_CS) ||
+        !gpio_valid_required(LCD_PIN_BK_LIGHT)) {
+        ESP_LOGW(TAG, "Invalid display GPIOs for this target (sclk=%d, mosi=%d, dc=%d, rst=%d, cs=%d, bl=%d)",
+                 LCD_PIN_SCLK, LCD_PIN_MOSI, LCD_PIN_DC, LCD_PIN_RST, LCD_PIN_CS, LCD_PIN_BK_LIGHT);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
 
     if (!s_display_lock) {
         s_display_lock = xSemaphoreCreateMutex();

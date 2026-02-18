@@ -5,18 +5,43 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdarg.h>
 #include "esp_log.h"
 #include "cJSON.h"
 
 static const char *TAG = "context";
+
+static size_t safe_snprintf(char *buf, size_t size, size_t offset, const char *fmt, ...)
+{
+    if (!buf || size == 0 || offset >= size - 1) {
+        return offset;
+    }
+    va_list args;
+    va_start(args, fmt);
+    int written = vsnprintf(buf + offset, size - offset, fmt, args);
+    va_end(args);
+    if (written < 0) {
+        return offset;
+    }
+    size_t w = (size_t)written;
+    if (w > size - offset - 1) {
+        w = size - offset - 1;
+    }
+    return offset + w;
+}
 
 static size_t append_file(char *buf, size_t size, size_t offset, const char *path, const char *header)
 {
     FILE *f = fopen(path, "r");
     if (!f) return offset;
 
-    if (header && offset < size - 1) {
-        offset += snprintf(buf + offset, size - offset, "\n## %s\n\n", header);
+    if (header) {
+        offset = safe_snprintf(buf, size, offset, "\n## %s\n\n", header);
+    }
+
+    if (offset >= size - 1) {
+        fclose(f);
+        return offset;
     }
 
     size_t n = fread(buf + offset, 1, size - offset - 1, f);
@@ -28,9 +53,12 @@ static size_t append_file(char *buf, size_t size, size_t offset, const char *pat
 
 esp_err_t context_build_system_prompt(char *buf, size_t size)
 {
+    if (!buf || size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
     size_t off = 0;
 
-    off += snprintf(buf + off, size - off,
+    off = safe_snprintf(buf, size, off,
         "# MimiClaw\n\n"
         "You are MimiClaw, a personal AI assistant running on an ESP32-S3 device.\n"
         "You communicate through Telegram and WebSocket.\n\n"
@@ -71,15 +99,15 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
     off = append_file(buf, size, off, MIMI_USER_FILE, "User Info");
 
     /* Long-term memory */
-    char mem_buf[4096];
+    static char mem_buf[4096];
     if (memory_read_long_term(mem_buf, sizeof(mem_buf)) == ESP_OK && mem_buf[0]) {
-        off += snprintf(buf + off, size - off, "\n## Long-term Memory\n\n%s\n", mem_buf);
+        off = safe_snprintf(buf, size, off, "\n## Long-term Memory\n\n%s\n", mem_buf);
     }
 
     /* Recent daily notes (last 3 days) */
-    char recent_buf[4096];
+    static char recent_buf[4096];
     if (memory_read_recent(recent_buf, sizeof(recent_buf), 3) == ESP_OK && recent_buf[0]) {
-        off += snprintf(buf + off, size - off, "\n## Recent Notes\n\n%s\n", recent_buf);
+        off = safe_snprintf(buf, size, off, "\n## Recent Notes\n\n%s\n", recent_buf);
     }
 
     /* Skills */

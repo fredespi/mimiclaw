@@ -89,23 +89,25 @@ typedef struct {
     size_t cap;
 } resp_buf_t;
 
+static char s_llm_resp_buf[MIMI_LLM_STREAM_BUF_SIZE];
+
 static esp_err_t resp_buf_init(resp_buf_t *rb, size_t initial_cap)
 {
-    rb->data = heap_caps_calloc(1, initial_cap, MALLOC_CAP_SPIRAM);
-    if (!rb->data) return ESP_ERR_NO_MEM;
+    (void)initial_cap;
+    rb->data = s_llm_resp_buf;
+    rb->cap = sizeof(s_llm_resp_buf);
     rb->len = 0;
-    rb->cap = initial_cap;
+    rb->data[0] = '\0';
     return ESP_OK;
 }
 
 static esp_err_t resp_buf_append(resp_buf_t *rb, const char *data, size_t len)
 {
-    while (rb->len + len >= rb->cap) {
-        size_t new_cap = rb->cap * 2;
-        char *tmp = heap_caps_realloc(rb->data, new_cap, MALLOC_CAP_SPIRAM);
-        if (!tmp) return ESP_ERR_NO_MEM;
-        rb->data = tmp;
-        rb->cap = new_cap;
+    if (!rb || !rb->data || rb->cap == 0) return ESP_ERR_INVALID_ARG;
+    if (!data || len == 0) return ESP_OK;
+    if (rb->len >= rb->cap - 1) return ESP_OK;
+    if (rb->len + len >= rb->cap) {
+        len = rb->cap - rb->len - 1;
     }
     memcpy(rb->data + rb->len, data, len);
     rb->len += len;
@@ -115,7 +117,6 @@ static esp_err_t resp_buf_append(resp_buf_t *rb, const char *data, size_t len)
 
 static void resp_buf_free(resp_buf_t *rb)
 {
-    free(rb->data);
     rb->data = NULL;
     rb->len = 0;
     rb->cap = 0;
@@ -127,7 +128,8 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 {
     resp_buf_t *rb = (resp_buf_t *)evt->user_data;
     if (evt->event_id == HTTP_EVENT_ON_DATA) {
-        resp_buf_append(rb, (const char *)evt->data, evt->data_len);
+        if (!rb || !rb->data) return ESP_ERR_INVALID_ARG;
+        return resp_buf_append(rb, (const char *)evt->data, evt->data_len);
     }
     return ESP_OK;
 }
@@ -177,6 +179,7 @@ esp_err_t llm_proxy_init(void)
         if (nvs_get_str(nvs, MIMI_NVS_KEY_API_KEY, tmp, &len) == ESP_OK && tmp[0]) {
             safe_copy(s_api_key, sizeof(s_api_key), tmp);
         }
+
         char model_tmp[LLM_MODEL_MAX_LEN] = {0};
         len = sizeof(model_tmp);
         if (nvs_get_str(nvs, MIMI_NVS_KEY_MODEL, model_tmp, &len) == ESP_OK && model_tmp[0]) {
@@ -219,9 +222,9 @@ static esp_err_t llm_http_direct(const char *post_data, resp_buf_t *rb, int *out
     esp_http_client_set_header(client, "Content-Type", "application/json");
     if (provider_is_openai()) {
         if (s_api_key[0]) {
-            char auth[LLM_API_KEY_MAX_LEN + 16];
-            snprintf(auth, sizeof(auth), "Bearer %s", s_api_key);
-            esp_http_client_set_header(client, "Authorization", auth);
+    char auth_header[384]; // large enough for Bearer + API key
+            snprintf(auth_header, sizeof(auth_header), "Bearer %s", s_api_key);
+            esp_http_client_set_header(client, "Authorization", auth_header);
         }
     } else {
         esp_http_client_set_header(client, "x-api-key", s_api_key);

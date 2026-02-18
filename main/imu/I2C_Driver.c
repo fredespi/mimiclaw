@@ -1,18 +1,30 @@
 #include "I2C_Driver.h"
 
-
+#include "esp_check.h"
+#include "soc/soc_caps.h"
 #define I2C_TRANS_BUF_MINIMUM_SIZE     (sizeof(i2c_cmd_desc_t) + \
                                         sizeof(i2c_cmd_link_t) * 8) /* It is required to have allocate one i2c_cmd_desc_t per command:
                                                                      * start + write (device address) + write buffer +
                                                                      * start + write (device address) + read buffer + read buffer for NACK +
                                                                      * stop */
 static const char *I2C_TAG = "I2C";
+
+static bool gpio_valid_required(int pin)
+{
+    return pin >= 0 && pin < SOC_GPIO_PIN_COUNT;
+}
 /**
  * @brief i2c master initialization
  */
 static esp_err_t i2c_master_init(void)
 {
     int i2c_master_port = I2C_MASTER_NUM;
+
+    if (!gpio_valid_required(I2C_Touch_SDA_IO) || !gpio_valid_required(I2C_Touch_SCL_IO)) {
+        ESP_LOGW(I2C_TAG, "Invalid I2C GPIOs for this target (sda=%d, scl=%d)",
+                 I2C_Touch_SDA_IO, I2C_Touch_SCL_IO);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
 
     i2c_config_t conf = {
         .mode = I2C_MODE_MASTER,
@@ -23,15 +35,21 @@ static esp_err_t i2c_master_init(void)
         .master.clk_speed = I2C_MASTER_FREQ_HZ,
     };
 
-    i2c_param_config(i2c_master_port, &conf);
+    ESP_RETURN_ON_ERROR(i2c_param_config(i2c_master_port, &conf), I2C_TAG, "i2c_param_config failed");
 
-    return i2c_driver_install(i2c_master_port, conf.mode, I2C_MASTER_RX_BUF_DISABLE, I2C_MASTER_TX_BUF_DISABLE, 0);
+    return i2c_driver_install(i2c_master_port, conf.mode, I2C_MASTER_RX_BUF_DISABLE,
+                              I2C_MASTER_TX_BUF_DISABLE, 0);
 }
-void I2C_Init(void)
+esp_err_t I2C_Init(void)
 {
     /********************* I2C *********************/
-    ESP_ERROR_CHECK(i2c_master_init());
-    ESP_LOGI(I2C_TAG, "I2C initialized successfully");  
+    esp_err_t ret = i2c_master_init();
+    if (ret == ESP_OK) {
+        ESP_LOGI(I2C_TAG, "I2C initialized successfully");
+    } else {
+        ESP_LOGW(I2C_TAG, "I2C init skipped: %s", esp_err_to_name(ret));
+    }
+    return ret;
 }
 
 

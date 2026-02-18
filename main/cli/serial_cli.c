@@ -6,6 +6,7 @@
 #include "memory/memory_store.h"
 #include "memory/session_mgr.h"
 #include "proxy/http_proxy.h"
+#include "telegram/telegram_tls_test.h"
 #include "tools/tool_registry.h"
 #include "tools/tool_web_search.h"
 #include "cron/cron_service.h"
@@ -200,6 +201,55 @@ static int cmd_heap_info(int argc, char **argv)
     printf("Total free:    %d bytes\n",
            (int)esp_get_free_heap_size());
     return 0;
+}
+
+/* --- tg_tls_test command --- */
+static int cmd_tg_tls_test(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    if (!wifi_manager_is_connected()) {
+        printf("WiFi not connected. Run wifi_status first.\n");
+        return 1;
+    }
+
+    printf("Running Telegram TLS self-test...\n");
+    esp_err_t err = telegram_tls_self_test(15000);
+    if (err == ESP_OK) {
+        printf("Telegram TLS test: OK\n");
+        return 0;
+    }
+
+    printf("Telegram TLS test failed: %s\n", esp_err_to_name(err));
+    return 1;
+}
+
+/* --- tg_start command --- */
+static int cmd_tg_start(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    if (!wifi_manager_is_connected()) {
+        printf("WiFi not connected. Run wifi_status first.\n");
+        return 1;
+    }
+
+    esp_err_t err = telegram_bot_start();
+    printf("Telegram start: %s\n", esp_err_to_name(err));
+    return (err == ESP_OK) ? 0 : 1;
+}
+
+/* --- tg_stop command --- */
+static int cmd_tg_stop(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    esp_err_t err = telegram_bot_stop();
+    printf("Telegram stop: %s\n", esp_err_to_name(err));
+    return (err == ESP_OK) ? 0 : 1;
 }
 
 /* --- set_proxy command --- */
@@ -552,11 +602,9 @@ esp_err_t serial_cli_init(void)
     repl_config.prompt = "mimi> ";
     repl_config.max_cmdline_length = 256;
 
-    /* USB Serial JTAG */
-    esp_console_dev_usb_serial_jtag_config_t hw_config =
-        ESP_CONSOLE_DEV_USB_SERIAL_JTAG_CONFIG_DEFAULT();
-
-    ESP_ERROR_CHECK(esp_console_new_repl_usb_serial_jtag(&hw_config, &repl_config, &repl));
+    /* Use UART for ESP32 CLI */
+    esp_console_dev_uart_config_t hw_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_console_new_repl_uart(&hw_config, &repl_config, &repl));
 
     /* Register commands */
     esp_console_register_help_command();
@@ -708,6 +756,30 @@ esp_err_t serial_cli_init(void)
         .func = &cmd_heap_info,
     };
     esp_console_cmd_register(&heap_cmd);
+
+    /* tg_tls_test */
+    esp_console_cmd_t tg_tls_cmd = {
+        .command = "tg_tls_test",
+        .help = "Run Telegram TLS HTTPS test (getMe)",
+        .func = &cmd_tg_tls_test,
+    };
+    esp_console_cmd_register(&tg_tls_cmd);
+
+    /* tg_start */
+    esp_console_cmd_t tg_start_cmd = {
+        .command = "tg_start",
+        .help = "Start Telegram polling",
+        .func = &cmd_tg_start,
+    };
+    esp_console_cmd_register(&tg_start_cmd);
+
+    /* tg_stop */
+    esp_console_cmd_t tg_stop_cmd = {
+        .command = "tg_stop",
+        .help = "Stop Telegram polling",
+        .func = &cmd_tg_stop,
+    };
+    esp_console_cmd_register(&tg_stop_cmd);
 
     /* set_search_key */
     search_key_args.key = arg_str1(NULL, NULL, "<key>", "Brave Search API key");
