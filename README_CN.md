@@ -55,7 +55,7 @@ idf.py set-target esp32s3
 ```
 
 <details>
-<summary>Ubuntu Install</summary>
+<summary>Ubuntu 安装</summary>
 
 建议基线：
 
